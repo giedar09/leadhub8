@@ -1,41 +1,47 @@
 import axios from 'axios';
 
-// Configuración por defecto
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3000';
-
-// Crear instancia de axios con URL base
+// Configuración de la API base
 const api = axios.create({
-  baseURL: `${API_URL}/api`,
+  baseURL: import.meta.env.VITE_API_URL || '/api',
+  timeout: 30000,
   headers: {
     'Content-Type': 'application/json',
+    'Accept': 'application/json'
   }
 });
 
-// Interceptor para incluir token de autenticación
+// Interceptor para añadir el token de autenticación
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('auth-storage') 
-      ? JSON.parse(localStorage.getItem('auth-storage')).state.token 
-      : null;
-    
+    const token = localStorage.getItem('auth_token');
     if (token) {
-      config.headers['Authorization'] = `Bearer ${token}`;
+      config.headers.Authorization = `Bearer ${token}`;
     }
     return config;
   },
-  (error) => Promise.reject(error)
+  (error) => {
+    return Promise.reject(error);
+  }
 );
 
-// Interceptor para manejar respuestas
+// Interceptor para manejar errores comunes
 api.interceptors.response.use(
-  (response) => response,
+  (response) => {
+    return response;
+  },
   (error) => {
-    // Manejar errores globales (por ejemplo, redirección en caso de 401)
-    if (error.response && error.response.status === 401) {
-      // Redireccionar a login o limpiar sesión
-      localStorage.removeItem('auth-storage');
-      window.location.href = '/login';
+    const { response } = error;
+    
+    // Si el error es 401 Unauthorized, redirigir a login
+    if (response && response.status === 401) {
+      localStorage.removeItem('auth_token');
+      
+      // Solo redirigir si no estamos ya en la página de login
+      if (!window.location.pathname.includes('/login')) {
+        window.location.href = '/login';
+      }
     }
+    
     return Promise.reject(error);
   }
 );
