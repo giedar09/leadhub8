@@ -1,11 +1,8 @@
 import { Routes, Route } from 'react-router-dom'
 import { Suspense, lazy } from 'react'
 
-// Páginas con carga diferida
-const Home = lazy(() => import('./pages/Home'))
-const Login = lazy(() => import('./pages/Login'))
-const NotFound = lazy(() => import('./pages/NotFound'))
-const WhatsappDashboard = lazy(() => import('./pages/WhatsappDashboard'))
+// Importar desde el barrel
+import { Home, Login, NotFound, WhatsappDashboard } from './pages'
 
 // Componente de carga
 const Loading = () => (

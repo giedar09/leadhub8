@@ -1,25 +1,10 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
-import WhatsappSidebar from '../components/whatsapp/WhatsappSidebar';
-import WhatsappChat from '../components/whatsapp/WhatsappChat';
-import WhatsappSessionManager from '../components/whatsapp/WhatsappSessionManager';
-import { useWhatsappStore } from '../stores/whatsappStore';
 import { io } from 'socket.io-client';
 
 // URL del servidor backend
 const API_URL = 'http://localhost:3000';
 
 const WhatsappDashboard = () => {
-  const navigate = useNavigate();
-  const { 
-    activeSession, 
-    activeChat, 
-    setActiveChat,
-    isSessionManagerOpen, 
-    toggleSessionManager 
-  } = useWhatsappStore();
-  
-  const [isMobile, setIsMobile] = useState(window.innerWidth < 768);
   const [phoneNumber, setPhoneNumber] = useState('');
   const [name, setName] = useState('');
   const [status, setStatus] = useState('disconnected');
@@ -27,23 +12,7 @@ const WhatsappDashboard = () => {
   const [error, setError] = useState('');
   const [socket, setSocket] = useState(null);
   const [messages, setMessages] = useState([]);
-
-  // Detector de tamaño de pantalla
-  useEffect(() => {
-    const handleResize = () => {
-      setIsMobile(window.innerWidth < 768);
-    };
-    
-    window.addEventListener('resize', handleResize);
-    return () => window.removeEventListener('resize', handleResize);
-  }, []);
-
-  // Redirigir a la página de inicio si no hay sesión activa
-  useEffect(() => {
-    if (!activeSession && !isSessionManagerOpen) {
-      toggleSessionManager(true);
-    }
-  }, [activeSession, isSessionManagerOpen, toggleSessionManager]);
+  const [activeSession, setActiveSession] = useState(null);
 
   // Conectar al socket al montar el componente
   useEffect(() => {
