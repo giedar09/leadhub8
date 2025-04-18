@@ -1,4 +1,5 @@
-import { Client, LocalAuth, MessageMedia } from 'whatsapp-web.js';
+import pkg from 'whatsapp-web.js';
+const { Client, LocalAuth, MessageMedia } = pkg;
 import fs from 'fs/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -37,15 +38,66 @@ const ensureDirectoriesExist = async () => {
 
 // Clase principal para gestionar las sesiones de WhatsApp
 class WhatsappService {
-  constructor() {
+  constructor(io) {
     this.clients = new Map(); // Almacenar instancias de clientes por número
     this.eventHandlers = {}; // Manejadores de eventos personalizados
+    this.io = io; // Guardar referencia a socket.io
     
     // Inicializar directorios
     ensureDirectoriesExist();
     
     // Cargar sesiones almacenadas al inicio
     this.loadSessions();
+  }
+  
+  // Método de inicialización (llamado desde index.js)
+  async init() {
+    try {
+      console.log('Inicializando servicio de WhatsApp...');
+      
+      // Configurar evento de Socket.IO para los eventos de WhatsApp
+      if (this.io) {
+        this.io.on('connection', (socket) => {
+          // Manejar evento para iniciar sesión de WhatsApp
+          socket.on('whatsapp:init', async (data) => {
+            try {
+              const { phoneNumber, sessionId } = data;
+              const client = await this.initClient(phoneNumber, sessionId);
+              socket.emit('whatsapp:init:success', { phoneNumber, status: 'connecting' });
+            } catch (error) {
+              socket.emit('whatsapp:init:error', { error: error.message });
+            }
+          });
+          
+          // Manejar evento para enviar mensaje de texto
+          socket.on('whatsapp:sendText', async (data) => {
+            try {
+              const { phoneNumber, to, text } = data;
+              const message = await this.sendTextMessage(phoneNumber, to, text);
+              socket.emit('whatsapp:sendText:success', { message });
+            } catch (error) {
+              socket.emit('whatsapp:sendText:error', { error: error.message });
+            }
+          });
+          
+          // Manejar otros eventos según sea necesario...
+        });
+        
+        // Configurar el event handler para enviar eventos a través de Socket.IO
+        this.eventHandler = (eventName, payload) => {
+          this.io.emit(`whatsapp:${eventName}`, payload);
+        };
+      }
+      
+      // Cargar sesiones activas desde la base de datos
+      await this.loadSessions();
+      
+      console.log('Servicio de WhatsApp inicializado correctamente');
+      return true;
+    } catch (error) {
+      console.error('Error al inicializar servicio de WhatsApp:', error);
+      throw error;
+    }
   }
   
   // Cargar todas las sesiones activas desde la base de datos
@@ -509,11 +561,11 @@ class WhatsappService {
   
   // Obtener cliente de WhatsApp para un número específico
   getClient(phoneNumber) {
-    const client = this.clients.get(phoneNumber);
-    if (!client) {
+    const clientInfo = this.clients.get(phoneNumber);
+    if (!clientInfo) {
       throw new Error(`No hay cliente activo para ${phoneNumber}`);
     }
-    return client;
+    return clientInfo.client;
   }
   
   // Enviar mensaje de texto
@@ -1000,4 +1052,239 @@ class WhatsappService {
       throw error;
     }
   }
-} 
+  
+  // Eliminar un mensaje específico (marcar como borrado)
+  async deleteMessage(phoneNumber, messageId) {
+    try {
+      // Verificar que el mensaje existe y pertenece al usuario
+      const message = await Message.findOne({
+        _id: messageId,
+        whatsappNumber: phoneNumber
+      });
+      
+      if (!message) {
+        throw new Error('Mensaje no encontrado o no pertenece a este usuario');
+      }
+      
+      // Marcar mensaje como borrado
+      await message.markAsDeleted();
+      
+      // Si el mensaje es muy reciente y es nuestro, intentar borrarlo en WhatsApp
+      const ONE_HOUR = 60 * 60 * 1000;
+      if (message.fromMe && Date.now() - message.timestamp < ONE_HOUR) {
+        try {
+          const client = this.getClient(phoneNumber);
+          
+          // Obtener mensaje de WhatsApp
+          const chat = await Chat.findById(message.chatId);
+          const msg = await client.getMessageById(message.messageId);
+          
+          if (msg) {
+            // Intentar borrar mensaje
+            await msg.delete(true); // true para borrar para todos
+          }
+        } catch (whatsappError) {
+          console.warn(`No se pudo borrar el mensaje en WhatsApp: ${whatsappError.message}`);
+          // Continuamos aunque falle el borrado en WhatsApp
+        }
+      }
+      
+      // Emitir evento de mensaje borrado
+      this._emitEvent('message_deleted', {
+        phoneNumber,
+        messageId,
+        chatId: message.chatId,
+        timestamp: new Date()
+      });
+      
+      return { success: true };
+    } catch (error) {
+      console.error(`Error al eliminar mensaje ${messageId}:`, error);
+      throw error;
+    }
+  }
+  
+  // Descargar un archivo multimedia
+  async downloadMedia(phoneNumber, messageId) {
+    try {
+      // Verificar que el mensaje existe y pertenece al usuario
+      const message = await Message.findOne({
+        _id: messageId,
+        whatsappNumber: phoneNumber
+      });
+      
+      if (!message) {
+        throw new Error('Mensaje no encontrado o no pertenece a este usuario');
+      }
+      
+      // Verificar que el mensaje tiene multimedia
+      if (!message.media || !message.media.path) {
+        throw new Error('El mensaje no contiene archivos multimedia');
+      }
+      
+      // Comprobar si el archivo existe
+      const fullPath = path.join(UPLOAD_DIR, message.media.path);
+      try {
+        await fs.access(fullPath);
+      } catch (error) {
+        // Si el archivo no existe localmente pero tenemos el ID del mensaje,
+        // intentamos descargarlo nuevamente desde WhatsApp
+        if (message.messageId) {
+          const client = this.getClient(phoneNumber);
+          
+          // Obtener mensaje de WhatsApp
+          const msg = await client.getMessageById(message.messageId);
+          
+          if (msg && msg.hasMedia) {
+            // Descargar media
+            const media = await msg.downloadMedia();
+            if (media) {
+              // Guardar archivo
+              const mediaResult = await this._saveMedia(media, phoneNumber);
+              
+              // Actualizar información del mensaje
+              message.media.url = mediaResult.url;
+              message.media.path = mediaResult.path;
+              message.media.size = mediaResult.size;
+              await message.save();
+              
+              // Devolver la ruta actualizada
+              return { 
+                url: mediaResult.url,
+                filename: path.basename(mediaResult.path),
+                mimetype: message.media.mimetype,
+                size: mediaResult.size
+              };
+            }
+          }
+          
+          throw new Error('No se pudo recuperar el archivo multimedia de WhatsApp');
+        } else {
+          throw new Error('El archivo multimedia no se encuentra disponible');
+        }
+      }
+      
+      // Devolver información del archivo
+      return {
+        url: message.media.url,
+        filename: path.basename(message.media.path),
+        mimetype: message.media.mimetype,
+        size: message.media.size || 0
+      };
+    } catch (error) {
+      console.error(`Error al descargar multimedia del mensaje ${messageId}:`, error);
+      throw error;
+    }
+  }
+  
+  // Reenviar un mensaje existente a otro destinatario
+  async forwardMessage(phoneNumber, messageId, toNumber) {
+    try {
+      // Verificar que el mensaje existe y pertenece al usuario
+      const message = await Message.findOne({
+        _id: messageId,
+        whatsappNumber: phoneNumber
+      });
+      
+      if (!message) {
+        throw new Error('Mensaje no encontrado o no pertenece a este usuario');
+      }
+      
+      // Normalizar número de destino
+      const chatId = toNumber.includes('@c.us') ? toNumber : `${toNumber}@c.us`;
+      const client = this.getClient(phoneNumber);
+      
+      // Obtener o crear chat de destino
+      const chat = await client.getChatById(chatId);
+      if (!chat) {
+        throw new Error(`No se pudo encontrar o crear el chat con ${toNumber}`);
+      }
+      
+      const chatData = await this._getOrCreateChat(chat, phoneNumber);
+      
+      // Reenviar según el tipo de mensaje
+      let response;
+      
+      if (message.type === 'text') {
+        // Reenviar mensaje de texto
+        response = await client.sendMessage(chatId, message.content);
+      } else if (message.media && message.media.path) {
+        // Reenviar mensaje multimedia
+        const fullPath = path.join(UPLOAD_DIR, message.media.path);
+        
+        try {
+          // Verificar que el archivo existe
+          await fs.access(fullPath);
+          
+          // Leer archivo
+          const mediaBuffer = await fs.readFile(fullPath);
+          const mediaMimetype = message.media.mimetype || mime.lookup(fullPath) || 'application/octet-stream';
+          
+          // Crear objeto de media para WhatsApp
+          const media = new MessageMedia(
+            mediaMimetype,
+            mediaBuffer.toString('base64'),
+            path.basename(message.media.path)
+          );
+          
+          // Enviar mensaje
+          response = await client.sendMessage(chatId, media, { 
+            caption: message.content 
+          });
+        } catch (error) {
+          throw new Error(`No se pudo acceder al archivo multimedia: ${error.message}`);
+        }
+      } else {
+        throw new Error('Tipo de mensaje no soportado para reenvío');
+      }
+      
+      // Guardar el mensaje reenviado en la base de datos
+      const newMessage = new Message({
+        messageId: response.id.id,
+        chatId: chatData._id,
+        whatsappNumber: phoneNumber,
+        type: message.type,
+        content: message.content,
+        fromMe: true,
+        timestamp: Date.now(),
+        sender: phoneNumber,
+        senderJid: phoneNumber,
+        media: message.media,
+        status: 'sent',
+        metadata: {
+          forwardedFrom: message._id,
+          rawData: JSON.stringify(response._data)
+        }
+      });
+      
+      await newMessage.save();
+      
+      // Actualizar chat
+      chatData.lastMessageAt = new Date();
+      chatData.lastMessageId = newMessage._id;
+      await chatData.save();
+      
+      // Actualizar estadísticas de la sesión
+      const session = await WhatsappSession.findOne({ phoneNumber });
+      if (session) {
+        await session.messageSent();
+      }
+      
+      // Emitir evento de mensaje reenviado
+      this._emitEvent('message_forwarded', {
+        phoneNumber,
+        originalMessageId: messageId,
+        newMessageId: newMessage._id,
+        chatId: chatData._id,
+        timestamp: new Date()
+      });
+      
+      return newMessage;
+    } catch (error) {
+      console.error(`Error al reenviar mensaje ${messageId}:`, error);
+      throw error;
+    }
+  }
+}
+
+export default WhatsappService; 
